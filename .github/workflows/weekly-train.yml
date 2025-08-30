@@ -1,0 +1,64 @@
+name: Weekly train and upload props models
+on:
+  schedule:
+    - cron: "0 14 * * TUE"   # Tuesdays 10:00 ET (14:00 UTC)
+  workflow_dispatch:
+
+jobs:
+  train-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run ETL
+        env:
+          SEASON_START: 2015
+          SEASON_END: ${{ github.event.inputs.season_end || '' }}
+        run: python etl_build_history.py
+
+      - name: Train regression models
+        run: python train_models_regression.py
+
+      - name: Upload to Hugging Face Hub (DATASET repo)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_MODELS_REPO: YOUR_HF_USERNAME/betbot-props-bundle   # <-- change me
+        run: |
+          python - <<'PY'
+          import os, glob, json, datetime
+          from huggingface_hub import HfApi, create_repo
+
+          repo_id = os.environ["HF_MODELS_REPO"]
+          token   = os.environ["HF_TOKEN"]
+          api = HfApi(token=token)
+
+          # Create as dataset repo (public). Set private=True if you want private.
+          create_repo(repo_id, repo_type="dataset", exist_ok=True, private=False)
+
+          # Version banner for UI
+          with open("props_version.json","w") as f:
+              json.dump({"built_at_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}, f)
+
+          # Upload artifacts the app expects
+          files = glob.glob("models/*.joblib") + glob.glob("models/*.json") + ["props_version.json"]
+          for path in files:
+              if not os.path.exists(path): 
+                  continue
+              print("Uploading:", path)
+              api.upload_file(
+                  path_or_fileobj=path,
+                  path_in_repo=os.path.basename(path),
+                  repo_id=repo_id,
+                  repo_type="dataset",
+              )
+          print("Done.")
+          PY
