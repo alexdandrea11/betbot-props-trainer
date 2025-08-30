@@ -77,17 +77,12 @@ def _fetch_weekly_by_year(year: int) -> pd.DataFrame:
     try:
         df = nfl.import_weekly_data([year])
         # unify key ID/name/team/opp BEFORE any renaming to avoid duplicate labels
-        # player
         player = _first_nonnull_series(df, ["player_display_name", "player_name", "player"], default=np.nan)
-        df = df.assign(player=player)
-        # team (prefer recent_team if present)
-        team = _first_nonnull_series(df, ["recent_team", "team"], default=np.nan)
-        df = df.assign(team=team)
-        # opponent team name
-        opp = _first_nonnull_series(df, ["opponent_team", "opponent"], default=np.nan)
-        df = df.assign(opp=opp)
+        team   = _first_nonnull_series(df, ["recent_team", "team"], default=np.nan)
+        opp    = _first_nonnull_series(df, ["opponent_team", "opponent"], default=np.nan)
+        df = df.assign(player=player, team=team, opp=opp)
 
-        # drop source columns we just unified to prevent duplicate labels later
+        # drop source cols to prevent duplicates
         drop_cols = [c for c in ["player_display_name","player_name","recent_team","opponent_team","opponent"] if c in df.columns]
         if drop_cols:
             df = df.drop(columns=drop_cols)
@@ -95,7 +90,6 @@ def _fetch_weekly_by_year(year: int) -> pd.DataFrame:
         # ensure ints
         df["season"] = _coerce_int(df, "season")
         df["week"]   = _coerce_int(df, "week")
-
         return df
     except Exception as e:
         print(f"[ETL] ⚠️ Skipping weekly for {year}: {e}")
@@ -104,26 +98,22 @@ def _fetch_weekly_by_year(year: int) -> pd.DataFrame:
 def _fetch_schedule_by_year(year: int) -> pd.DataFrame:
     import nfl_data_py as nfl
     try:
-        sch = nfl.import_schedules([year])
-        return sch
+        return nfl.import_schedules([year])
     except Exception as e:
         print(f"[ETL] ⚠️ Skipping schedule for {year}: {e}")
         return pd.DataFrame()
 
 def load_weekly(seasons):
     """Load weekly player data (year-by-year) and attach schedule info for days_rest and is_home."""
-    # 1) Pull weekly per-year, skipping missing seasons
-    weekly_parts = []
-    available_years = []
+    # 1) weekly per-year, skipping missing seasons
+    weekly_parts, available_years = [], []
     for y in seasons:
         df_y = _fetch_weekly_by_year(y)
         if not df_y.empty:
             weekly_parts.append(df_y)
             available_years.append(y)
-
     if not weekly_parts:
         raise RuntimeError("No weekly data available for any requested season.")
-
     df = pd.concat(weekly_parts, ignore_index=True)
     print(f"[ETL] Weekly rows across {len(available_years)} season(s): {len(df):,}")
 
@@ -143,7 +133,7 @@ def load_weekly(seasons):
     if "position" not in df.columns:
         df["position"] = ""
 
-    # 2) Pull schedules per available year (skip missing)
+    # 2) schedules per available year (skip missing)
     sch_parts = []
     for y in available_years:
         sch_y = _fetch_schedule_by_year(y)
@@ -151,10 +141,9 @@ def load_weekly(seasons):
             sch_parts.append(sch_y)
     sch = pd.concat(sch_parts, ignore_index=True) if sch_parts else pd.DataFrame()
 
-    # 3) Attach schedule info for dates/home/away if available
+    # 3) attach schedule info for dates/home/away if available
     if not sch.empty:
         sch = sch.rename(columns={"home_team": "home", "away_team": "away"})
-        # Pick a valid date column if present
         dtcol = next((c for c in ("gameday", "game_date", "start_time", "game_time", "game_date_time") if c in sch.columns), None)
         sch["game_date"] = pd.to_datetime(sch[dtcol], errors="coerce") if dtcol else pd.NaT
         sch_small = sch[["season", "week", "home", "away", "game_date"]].copy()
@@ -173,7 +162,7 @@ def load_weekly(seasons):
         # days_rest
         tmp["game_date"] = pd.to_datetime(tmp["game_date"], errors="coerce")
         tmp = tmp.sort_values(["player", "season", "week"])
-        tmp["prev_date"] = tmp.groupby("player")["game_date"].shift(1)
+        tmp["prev_date"] = tmp.groupby("player", group_keys=False)["game_date"].shift(1)
         tmp["days_rest"] = (tmp["game_date"] - tmp["prev_date"]).dt.days
         tmp["days_rest"] = tmp["days_rest"].fillna(7).clip(lower=3, upper=21)
 
@@ -184,7 +173,7 @@ def load_weekly(seasons):
         tmp = tmp[keep_cols]
         return tmp.reset_index(drop=True)
 
-    # 4) Fallback without schedules
+    # 4) fallback without schedules
     print("[ETL] ⚠️ No schedule data available; using defaults (is_home NaN, days_rest=7).")
     df["is_home"] = np.nan
     df["days_rest"] = 7
@@ -196,12 +185,9 @@ def load_weekly(seasons):
 def make_rolling_feats(df, col, groups=["player"], windows=(3, 5, 8), suffixes=("l3", "l5", "l8")):
     """Create shifted rolling means so current-week label isn't leaked."""
     out = df.copy().sort_values(groups + ["season", "week"])
+    g = out.groupby(groups, group_keys=False, sort=False)
     for w, suf in zip(windows, suffixes):
-        out[f"{col}_{suf}"] = (
-            out.groupby(groups)[col]
-               .apply(lambda s: s.shift(1).rolling(w, min_periods=1).mean())
-               .reset_index(level=groups, drop=True)
-        )
+        out[f"{col}_{suf}"] = g[col].apply(lambda s: s.shift(1).rolling(w, min_periods=1).mean())
     return out
 
 def build_defense_allowed(df, y_col):
@@ -213,12 +199,9 @@ def build_defense_allowed(df, y_col):
     tmp["def_team"] = tmp["opp"]
     allowed = tmp.groupby(["season", "week", "def_team"], as_index=False)[y_col].sum()
     allowed = allowed.sort_values(["def_team", "season", "week"]).reset_index(drop=True)
+    g = allowed.groupby("def_team", group_keys=False, sort=False)
     for w, suf in [(3, "l3"), (5, "l5"), (8, "l8")]:
-        allowed[f"{y_col}_allowed_{suf}"] = (
-            allowed.groupby("def_team")[y_col]
-                   .apply(lambda s: s.shift(1).rolling(w, min_periods=1).mean())
-                   .reset_index(level="def_team", drop=True)
-        )
+        allowed[f"{y_col}_allowed_{suf}"] = g[y_col].apply(lambda s: s.shift(1).rolling(w, min_periods=1).mean())
     keep = ["season", "week", "def_team"] + [f"{y_col}_allowed_{suf}" for suf in ["l3", "l5", "l8"]]
     return allowed[keep]
 
@@ -227,8 +210,8 @@ def build_h2h_mean(df, y_col):
     Player vs opponent: expanding mean of y_col (prior-only: shifted by 1).
     """
     tmp = df.sort_values(["player", "opp", "season", "week"]).copy()
-    grp = tmp.groupby(["player", "opp"])
-    tmp["h2h_mean_alltime"] = grp[y_col].apply(lambda s: s.shift(1).expanding(1).mean()).reset_index(level=[0,1], drop=True)
+    g = tmp.groupby(["player", "opp"], group_keys=False, sort=False)
+    tmp["h2h_mean_alltime"] = g[y_col].apply(lambda s: s.shift(1).expanding(1).mean())
     return tmp[["player", "opp", "season", "week", "h2h_mean_alltime"]]
 
 def build_table_for_market(df, market_key, spec):
