@@ -31,7 +31,7 @@ jobs:
       - name: Upload to Hugging Face Hub (DATASET repo)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_MODELS_REPO: YOUR_HF_USERNAME/betbot-props-bundle   # <-- change me
+          HF_MODELS_REPO: alexdandrea/betbot-props-bundle   # <-- change me
         run: |
           python - <<'PY'
           import os, glob, json, datetime
