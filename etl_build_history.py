@@ -14,9 +14,7 @@ import numpy as np
 # ---------------------- robust env parsing ----------------------
 def _int_env(name: str, default: int) -> int:
     val = os.getenv(name, "")
-    if val is None:
-        return int(default)
-    val = str(val).strip()
+    val = "" if val is None else str(val).strip()
     if not val:
         return int(default)
     try:
@@ -63,20 +61,47 @@ def _coerce_int(df: pd.DataFrame, col: str) -> pd.Series:
         return pd.Series(dtype="Int64")
     return safe_num(df[col]).astype("Int64").astype(float).astype(int)
 
+def _first_nonnull_series(df: pd.DataFrame, cols: list, default=None):
+    """Combine several possible source columns into one, in priority order."""
+    out = None
+    for c in cols:
+        if c in df.columns:
+            s = df[c]
+            out = s if out is None else out.where(out.notna(), s)
+    if out is None:
+        out = pd.Series(default, index=df.index if len(df.index) else None, dtype=object)
+    return out
+
 def _fetch_weekly_by_year(year: int) -> pd.DataFrame:
-    """Try to fetch weekly data for a single season; return empty DataFrame if unavailable."""
     import nfl_data_py as nfl
     try:
         df = nfl.import_weekly_data([year])
+        # unify key ID/name/team/opp BEFORE any renaming to avoid duplicate labels
+        # player
+        player = _first_nonnull_series(df, ["player_display_name", "player_name", "player"], default=np.nan)
+        df = df.assign(player=player)
+        # team (prefer recent_team if present)
+        team = _first_nonnull_series(df, ["recent_team", "team"], default=np.nan)
+        df = df.assign(team=team)
+        # opponent team name
+        opp = _first_nonnull_series(df, ["opponent_team", "opponent"], default=np.nan)
+        df = df.assign(opp=opp)
+
+        # drop source columns we just unified to prevent duplicate labels later
+        drop_cols = [c for c in ["player_display_name","player_name","recent_team","opponent_team","opponent"] if c in df.columns]
+        if drop_cols:
+            df = df.drop(columns=drop_cols)
+
+        # ensure ints
         df["season"] = _coerce_int(df, "season")
         df["week"]   = _coerce_int(df, "week")
+
         return df
     except Exception as e:
         print(f"[ETL] ⚠️ Skipping weekly for {year}: {e}")
         return pd.DataFrame()
 
 def _fetch_schedule_by_year(year: int) -> pd.DataFrame:
-    """Try to fetch schedule for a single season; return empty DataFrame if unavailable."""
     import nfl_data_py as nfl
     try:
         sch = nfl.import_schedules([year])
@@ -102,22 +127,6 @@ def load_weekly(seasons):
     df = pd.concat(weekly_parts, ignore_index=True)
     print(f"[ETL] Weekly rows across {len(available_years)} season(s): {len(df):,}")
 
-    # 2) Standardize column names
-    rename = {
-        "player_display_name": "player",
-        "player_name": "player",
-        "recent_team": "team",
-        "team": "team",
-        "opponent_team": "opp",
-        "opponent": "opp",
-        "position": "position",
-        "week": "week",
-        "season": "season",
-    }
-    for k, v in rename.items():
-        if k in df.columns and v != k:
-            df = df.rename(columns={k: v})
-
     # Ensure core numeric stat columns exist
     base_stats = [
         "receptions", "receiving_yards", "targets",
@@ -130,38 +139,26 @@ def load_weekly(seasons):
         else:
             df[c] = 0.0
 
-    # week / season as ints (already coerced but ensure)
-    df["week"] = _coerce_int(df, "week")
-    df["season"] = _coerce_int(df, "season")
+    # position
+    if "position" not in df.columns:
+        df["position"] = ""
 
-    # 3) Pull schedules per available year (skip missing)
+    # 2) Pull schedules per available year (skip missing)
     sch_parts = []
     for y in available_years:
         sch_y = _fetch_schedule_by_year(y)
         if not sch_y.empty:
             sch_parts.append(sch_y)
+    sch = pd.concat(sch_parts, ignore_index=True) if sch_parts else pd.DataFrame()
 
-    if sch_parts:
-        sch = pd.concat(sch_parts, ignore_index=True)
-    else:
-        sch = pd.DataFrame()
-
-    # 4) Attach schedule info for dates/home/away if available
+    # 3) Attach schedule info for dates/home/away if available
     if not sch.empty:
         sch = sch.rename(columns={"home_team": "home", "away_team": "away"})
         # Pick a valid date column if present
-        dtcol = None
-        for candidate in ("gameday", "game_date", "start_time", "game_time", "game_date_time"):
-            if candidate in sch.columns:
-                dtcol = candidate
-                break
-
-        if dtcol:
-            sch["game_date"] = pd.to_datetime(sch[dtcol], errors="coerce")
-        else:
-            sch["game_date"] = pd.NaT
-
+        dtcol = next((c for c in ("gameday", "game_date", "start_time", "game_time", "game_date_time") if c in sch.columns), None)
+        sch["game_date"] = pd.to_datetime(sch[dtcol], errors="coerce") if dtcol else pd.NaT
         sch_small = sch[["season", "week", "home", "away", "game_date"]].copy()
+
         tmp = df.merge(sch_small, on=["season", "week"], how="left")
 
         # is_home flag
@@ -187,7 +184,7 @@ def load_weekly(seasons):
         tmp = tmp[keep_cols]
         return tmp.reset_index(drop=True)
 
-    # 5) Fallback without schedules
+    # 4) Fallback without schedules
     print("[ETL] ⚠️ No schedule data available; using defaults (is_home NaN, days_rest=7).")
     df["is_home"] = np.nan
     df["days_rest"] = 7
@@ -267,10 +264,7 @@ def build_table_for_market(df, market_key, spec):
     for c in list(out.columns):
         if c.endswith(("_l3", "_l5", "_l8", "_alltime")):
             vals = pd.to_numeric(out[c], errors="coerce")
-            if np.isfinite(vals).any():
-                out[c] = vals.fillna(vals.median())
-            else:
-                out[c] = 0.0
+            out[c] = vals.fillna(vals.median() if np.isfinite(vals).any() else 0.0)
 
     # Final selection + rename target to y
     out["y"] = pd.to_numeric(out[y_col], errors="coerce").fillna(0.0).astype(float)
