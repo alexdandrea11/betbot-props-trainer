@@ -34,7 +34,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 MARKETS = {
     "player_receptions": {
         "y_col": "receptions",
-        "aux_feats": ["targets"],   # we’ll also make targets_l5
+        "aux_feats": ["targets"],
         "prefix": "receptions",
     },
     "player_reception_yds": {
@@ -63,14 +63,46 @@ def _coerce_int(df: pd.DataFrame, col: str) -> pd.Series:
         return pd.Series(dtype="Int64")
     return safe_num(df[col]).astype("Int64").astype(float).astype(int)
 
-def load_weekly(seasons):
-    """Load weekly player data and attach schedule info for days_rest and is_home."""
+def _fetch_weekly_by_year(year: int) -> pd.DataFrame:
+    """Try to fetch weekly data for a single season; return empty DataFrame if unavailable."""
     import nfl_data_py as nfl
+    try:
+        df = nfl.import_weekly_data([year])
+        df["season"] = _coerce_int(df, "season")
+        df["week"]   = _coerce_int(df, "week")
+        return df
+    except Exception as e:
+        print(f"[ETL] ⚠️ Skipping weekly for {year}: {e}")
+        return pd.DataFrame()
 
-    # Weekly player stats
-    df = nfl.import_weekly_data(seasons)
+def _fetch_schedule_by_year(year: int) -> pd.DataFrame:
+    """Try to fetch schedule for a single season; return empty DataFrame if unavailable."""
+    import nfl_data_py as nfl
+    try:
+        sch = nfl.import_schedules([year])
+        return sch
+    except Exception as e:
+        print(f"[ETL] ⚠️ Skipping schedule for {year}: {e}")
+        return pd.DataFrame()
 
-    # Standardize column names
+def load_weekly(seasons):
+    """Load weekly player data (year-by-year) and attach schedule info for days_rest and is_home."""
+    # 1) Pull weekly per-year, skipping missing seasons
+    weekly_parts = []
+    available_years = []
+    for y in seasons:
+        df_y = _fetch_weekly_by_year(y)
+        if not df_y.empty:
+            weekly_parts.append(df_y)
+            available_years.append(y)
+
+    if not weekly_parts:
+        raise RuntimeError("No weekly data available for any requested season.")
+
+    df = pd.concat(weekly_parts, ignore_index=True)
+    print(f"[ETL] Weekly rows across {len(available_years)} season(s): {len(df):,}")
+
+    # 2) Standardize column names
     rename = {
         "player_display_name": "player",
         "player_name": "player",
@@ -98,16 +130,26 @@ def load_weekly(seasons):
         else:
             df[c] = 0.0
 
-    # week / season as ints
+    # week / season as ints (already coerced but ensure)
     df["week"] = _coerce_int(df, "week")
     df["season"] = _coerce_int(df, "season")
 
-    # Schedule for game dates (to compute days_rest) and host/away
-    try:
-        sch = nfl.import_schedules(seasons)
-        sch = sch.rename(columns={"home_team": "home", "away_team": "away"})
+    # 3) Pull schedules per available year (skip missing)
+    sch_parts = []
+    for y in available_years:
+        sch_y = _fetch_schedule_by_year(y)
+        if not sch_y.empty:
+            sch_parts.append(sch_y)
 
-        # Attempt to find a valid date column
+    if sch_parts:
+        sch = pd.concat(sch_parts, ignore_index=True)
+    else:
+        sch = pd.DataFrame()
+
+    # 4) Attach schedule info for dates/home/away if available
+    if not sch.empty:
+        sch = sch.rename(columns={"home_team": "home", "away_team": "away"})
+        # Pick a valid date column if present
         dtcol = None
         for candidate in ("gameday", "game_date", "start_time", "game_time", "game_date_time"):
             if candidate in sch.columns:
@@ -131,29 +173,28 @@ def load_weekly(seasons):
             tmp["opp"] = np.where(tmp["is_home"] == 1, tmp["away"],
                            np.where(tmp["is_home"] == 0, tmp["home"], tmp.get("opp", "")))
 
+        # days_rest
         tmp["game_date"] = pd.to_datetime(tmp["game_date"], errors="coerce")
         tmp = tmp.sort_values(["player", "season", "week"])
         tmp["prev_date"] = tmp.groupby("player")["game_date"].shift(1)
         tmp["days_rest"] = (tmp["game_date"] - tmp["prev_date"]).dt.days
         tmp["days_rest"] = tmp["days_rest"].fillna(7).clip(lower=3, upper=21)
 
-        # Clean
         tmp["is_home"] = pd.to_numeric(tmp["is_home"], errors="coerce")
         tmp["days_rest"] = pd.to_numeric(tmp["days_rest"], errors="coerce").fillna(7)
 
-        # Keep minimal useful cols + all stats
         keep_cols = ["player", "team", "opp", "season", "week", "position", "is_home", "days_rest"] + base_stats
         tmp = tmp[keep_cols]
         return tmp.reset_index(drop=True)
 
-    except Exception:
-        # Fallback if schedule fetch fails
-        df["is_home"] = np.nan
-        df["days_rest"] = 7
-        if "opp" not in df.columns:
-            df["opp"] = ""
-        keep_cols = ["player", "team", "opp", "season", "week", "position", "is_home", "days_rest"] + base_stats
-        return df[keep_cols].reset_index(drop=True)
+    # 5) Fallback without schedules
+    print("[ETL] ⚠️ No schedule data available; using defaults (is_home NaN, days_rest=7).")
+    df["is_home"] = np.nan
+    df["days_rest"] = 7
+    if "opp" not in df.columns:
+        df["opp"] = ""
+    keep_cols = ["player", "team", "opp", "season", "week", "position", "is_home", "days_rest"] + base_stats
+    return df[keep_cols].reset_index(drop=True)
 
 def make_rolling_feats(df, col, groups=["player"], windows=(3, 5, 8), suffixes=("l3", "l5", "l8")):
     """Create shifted rolling means so current-week label isn't leaked."""
@@ -173,7 +214,6 @@ def build_defense_allowed(df, y_col):
     """
     tmp = df.copy()
     tmp["def_team"] = tmp["opp"]
-    # aggregate stat by defense per (season, week)
     allowed = tmp.groupby(["season", "week", "def_team"], as_index=False)[y_col].sum()
     allowed = allowed.sort_values(["def_team", "season", "week"]).reset_index(drop=True)
     for w, suf in [(3, "l3"), (5, "l5"), (8, "l8")]:
